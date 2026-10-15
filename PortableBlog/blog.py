@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Portable Blog: standard-library-only local publishing."""
+import base64, hashlib, hmac, io, json, mimetypes, os, re, secrets, shutil, sqlite3, sys, threading, time, urllib.parse, webbrowser, zipfile
+from pathlib import Path
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / 'data'
+MEDIA = DATA / 'media'
+MEDIA.mkdir(parents=True, exist_ok=True)
+DB = DATA / 'blog.sqlite3'
+LOCK = threading.RLock()
+SESSIONS = {}
+ALLOWED = {'.jpg','.jpeg','.png','.gif','.webp','.avif','.bmp','.mp4','.webm','.ogg','.mov','.m4v','.mp3','.wav','.pdf','.txt'}
+def connect():
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    return c
+def init():
+    with connect() as c:
+        c.executescript('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,category TEXT NOT NULL,status TEXT NOT NULL,created TEXT NOT NULL,updated TEXT NOT NULL,attachments TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,name TEXT NOT NULL,file TEXT NOT NULL,type TEXT NOT NULL,size INTEGER NOT NULL,created TEXT NOT NULL);''')
+        defaults={'title':'我的离线博客','subtitle':'记录生活，收藏时光。','accent':'#335c49','background':'#f6f3ed','categories':['生活记录','学习笔记'],'menus':[{'label':'首页','target':'home'},{'label':'文章归档','target':'archive'},{'label':'媒体收藏','target':'media'}]}
+        for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',(k,json.dumps(v,ensure_ascii=False)))
+def setting(k,default=None):
+    with connect() as c:
+        row=c.execute('SELECT value FROM settings WHERE key=?',(k,)).fetchone()
+        return json.loads(row[0]) if row else default
+def save_setting(c,k,v): c.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(k,json.dumps(v,ensure_ascii=False)))
+def now(): return time.strftime('%Y-%m-%d %H:%M:%S')
+def password_hash(p,salt): return hashlib.scrypt(p.encode(),salt=bytes.fromhex(salt),n=16384,r=8,p=1).hex()
+class Server(ThreadingHTTPServer):
+    daemon_threads=True
+class Handler(BaseHTTPRequestHandler):
+    protocol_version='HTTP/1.1'
+    def log_message(self,fmt,*args): pass
+    def respond(self,status,body=b'',mime='application/json; charset=utf-8',headers=None):
+        if isinstance(body,(dict,list)): body=json.dumps(body,ensure_ascii=False).encode()
+        if isinstance(body,str): body=body.encode()
+        self.send_response(status)
+        self.send_header('Content-Type',mime)
+        self.send_header('Content-Length',str(len(body)))
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('X-Frame-Options','DENY')
+        self.send_header('Cache-Control','no-store')
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        for k,v in (headers or {}).items(): self.send_header(k,v)
+        self.end_headers()
+        if self.command!='HEAD': self.wfile.write(body)
+    def auth(self):
+        cookie=self.headers.get('Cookie','')
+        m=re.search(r'(?:^|;\s*)blog_session=([a-f0-9]+)',cookie)
+        return bool(m and SESSIONS.get(m[1],0)>time.time())
+    def valid_host(self):
+        return self.headers.get('Host') in ('127.0.0.1:'+str(self.server.server_port),'localhost:'+str(self.server.server_port))
+    def do_GET(self):
+        try: self.get()
+        except (BrokenPipeError,ConnectionResetError): pass
+        except Exception: self.respond(500,{'error':'读取失败，请检查数据文件或重启服务。'})
+    def do_HEAD(self): self.do_GET()
+    def get(self):
+        if not self.valid_host(): return self.respond(403,{'error':'不允许的访问地址'})
+        url=urllib.parse.urlsplit(self.path); path=url.path
+        if path=='/': return self.respond(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
+        if path=='/api/state':
+            with connect() as c:
+                settings={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM settings') if r['key']!='password'}
+                posts=[dict(r) for r in c.execute('SELECT * FROM posts ORDER BY created DESC') if self.auth() or r['status']=='published']
+                media=[dict(r) for r in c.execute('SELECT * FROM media ORDER BY created DESC')]
+                if not self.auth():
+                    visible={a for p in posts for a in json.loads(p['attachments'])}
+                    media=[m for m in media if m['id'] in visible]
+            for p in posts: p['attachments']=json.loads(p['attachments'])
+            return self.respond(200,{'settings':settings,'posts':posts,'media':media,'admin':self.auth(),'needs_setup':setting('password') is None})
+        if path.startswith('/media/'):
+            ident=path.split('/')[-1]
+            with connect() as c:
+                row=c.execute('SELECT * FROM media WHERE id=?',(ident,)).fetchone()
+                if row and not self.auth():
+                    public=any(ident in json.loads(p[0]) for p in c.execute("SELECT attachments FROM posts WHERE status='published'"))
+                    if not public: row=None
+            if not row: return self.respond(404,{'error':'文件不存在或尚未发布'})
+            file=MEDIA/row['file']
+            if not file.is_file(): return self.respond(404,{'error':'文件丢失'})
+            size=file.stat().st_size; start=0; end=size-1; status=200
+            ran=self.headers.get('Range')
+            if ran:
+                m=re.fullmatch(r'bytes=(\d*)-(\d*)',ran)
+                if not m or not any(m.groups()): return self.respond(416,b'',headers={'Content-Range':f'bytes */{size}'})
+                if m[1]: start=int(m[1]); end=min(int(m[2]),end) if m[2] else end
+                else: start=max(0,size-int(m[2]))
+                if start>end or start>=size: return self.respond(416,b'',headers={'Content-Range':f'bytes */{size}'})
+                status=206
+            self.send_response(status); self.send_header('Content-Type',row['type']); self.send_header('Content-Length',str(end-start+1)); self.send_header('Accept-Ranges','bytes'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Cache-Control','no-store')
+            self.send_header('Content-Disposition',"inline; filename*=UTF-8''"+urllib.parse.quote(row['name']))
+            if status==206: self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
+            self.end_headers()
+            if self.command!='HEAD':
+                with file.open('rb') as f:
+                    f.seek(start); remaining=end-start+1
+                    while remaining:
+                        b=f.read(min(1024*1024,remaining))
+                        if not b: break
+                        self.wfile.write(b); remaining-=len(b)
+            return
+        if path=='/api/backup':
+            if not self.auth(): return self.respond(401,{'error':'请先登录'})
+            # Consistent DB snapshot; media cannot be mutated during backup creation.
+            import tempfile
+            with LOCK, tempfile.TemporaryDirectory(dir=DATA) as temp:
+                dest=Path(temp)/'blog.sqlite3'
+                with connect() as src, sqlite3.connect(dest) as dst: src.backup(dst)
+                archive=Path(temp)/'backup.zip'
+                with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
+                    z.write(dest,'data/blog.sqlite3')
+                    for f in MEDIA.iterdir():
+                        if f.is_file(): z.write(f,'data/media/'+f.name)
+                size=archive.stat().st_size
+                self.send_response(200); self.send_header('Content-Type','application/zip'); self.send_header('Content-Length',str(size)); self.send_header('Content-Disposition','attachment; filename="blog-backup-'+time.strftime('%Y%m%d-%H%M%S')+'.zip"'); self.end_headers()
+                if self.command!='HEAD':
+                    with archive.open('rb') as f: shutil.copyfileobj(f,self.wfile)
+            return
+        self.respond(404,{'error':'页面不存在'})
+    def do_POST(self):
+        try:
+            if not self.valid_host(): return self.respond(403,{'error':'访问地址不正确'})
+            expected={'http://127.0.0.1:'+str(self.server.server_port),'http://localhost:'+str(self.server.server_port)}
+            if self.headers.get('Origin') not in expected or self.headers.get('X-Blog-Request')!='1': return self.respond(403,{'error':'请求来源校验失败'})
+            length=int(self.headers.get('Content-Length','0'))
+            if length<0: return self.respond(400,{'error':'无效长度'})
+            path=urllib.parse.urlsplit(self.path).path
+            if path=='/api/upload':
+                if not self.auth(): return self.respond(401,{'error':'请先登录'})
+                if length>1024**3: return self.respond(413,{'error':'单文件最大支持 1GB'})
+                name=urllib.parse.unquote(self.headers.get('X-Filename','file'))
+                name=name.replace('\\','/').split('/')[-1][:240]; ext=Path(name).suffix.lower()
+                if ext not in ALLOWED: return self.respond(400,{'error':'支持常见图片、视频、音频、PDF 和 TXT 文件；不支持该格式'})
+                ident=secrets.token_hex(16); filename=ident+ext; target=MEDIA/filename
+                with LOCK:
+                    try:
+                        with target.open('xb') as f:
+                            remaining=length
+                            while remaining:
+                                chunk=self.rfile.read(min(1024*1024,remaining))
+                                if not chunk: raise ValueError('文件上传中断')
+                                f.write(chunk); remaining-=len(chunk)
+                        mime=mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                        with connect() as c: c.execute('INSERT INTO media VALUES (?,?,?,?,?,?)',(ident,name,filename,mime,length,now()))
+                    except Exception:
+                        target.unlink(missing_ok=True); raise
+                return self.respond(200,{'id':ident})
+            if length>4*1024**2: return self.respond(413,{'error':'文本内容过大'})
+            data=json.loads(self.rfile.read(length) or b'{}')
+            with LOCK:
+                if path in ('/api/setup','/api/login'):
+                    password=data.get('password','')
+                    if not isinstance(password,str) or len(password)>256: raise ValueError('密码长度不正确')
+                    current=setting('password')
+                    if path=='/api/setup':
+                        if current: return self.respond(409,{'error':'后台已经初始化，请登录'})
+                        if len(password)<8: raise ValueError('请设置至少 8 位密码')
+                        salt=secrets.token_hex(16)
+                        with connect() as c: save_setting(c,'password',{'salt':salt,'hash':password_hash(password,salt)})
+                    elif not current or not hmac.compare_digest(password_hash(password,current['salt']),current['hash']):
+                        time.sleep(0.5); return self.respond(401,{'error':'密码错误'})
+                    token=secrets.token_hex(32); SESSIONS[token]=time.time()+12*3600
+                    return self.respond(200,{'ok':True},headers={'Set-Cookie':f'blog_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'})
+                if not self.auth(): return self.respond(401,{'error':'登录已过期，请重新登录'})
+                if path=='/api/logout':
+                    for token in re.findall(r'blog_session=([a-f0-9]+)',self.headers.get('Cookie','')): SESSIONS.pop(token,None)
+                    return self.respond(200,{'ok':True},headers={'Set-Cookie':'blog_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+                if path=='/api/post':
+                    title=str(data.get('title','')).strip()[:200]
+                    if not title: raise ValueError('请填写文章标题')
+                    ident=data.get('id') or secrets.token_hex(16)
+                    status=data.get('status','draft')
+                    if status not in ('draft','published'): raise ValueError('文章状态不正确')
+                    category=str(data.get('category',''))
+                    if category and category not in setting('categories'): raise ValueError('请选择已有类目')
+                    attachments=data.get('attachments',[])
+                    if not isinstance(attachments,list): raise ValueError('附件格式错误')
+                    with connect() as c:
+                        valid={r[0] for r in c.execute('SELECT id FROM media')}
+                        if any(x not in valid for x in attachments): raise ValueError('附件不存在')
+                        existing=c.execute('SELECT created FROM posts WHERE id=?',(ident,)).fetchone()
+                        c.execute('INSERT OR REPLACE INTO posts VALUES (?,?,?,?,?,?,?,?)',(ident,title,str(data.get('body','')),category,status,existing[0] if existing else now(),now(),json.dumps(list(dict.fromkeys(attachments)))))
+                    return self.respond(200,{'id':ident})
+                if path=='/api/delete-post':
+                    with connect() as c: c.execute('DELETE FROM posts WHERE id=?',(data.get('id'),))
+                elif path=='/api/delete-media':
+                    ident=data.get('id')
+                    with connect() as c:
+                        if any(ident in json.loads(r[0]) for r in c.execute('SELECT attachments FROM posts')): raise ValueError('文件正在被文章使用，请先从文章附件中移除')
+                        row=c.execute('SELECT file FROM media WHERE id=?',(ident,)).fetchone()
+                        if row: (MEDIA/row[0]).unlink(missing_ok=True)
+                        c.execute('DELETE FROM media WHERE id=?',(ident,))
+                elif path=='/api/settings':
+                    cats=data.get('categories',[]); menus=data.get('menus',[])
+                    if not isinstance(cats,list) or len(cats)>100 or any(not isinstance(x,str) or not x.strip() or len(x)>80 for x in cats): raise ValueError('类目格式不正确，最多 100 个')
+                    if not isinstance(menus,list) or len(menus)>20: raise ValueError('菜单最多 20 项')
+                    targets={'home','archive','media'}|{'category:'+x for x in cats}
+                    for m in menus:
+                        if not isinstance(m,dict) or m.get('target') not in targets or not str(m.get('label','')).strip(): raise ValueError('菜单目标需为首页、归档、媒体或现有类目')
+                    for k in ('accent','background'):
+                        if not re.fullmatch(r'#[0-9a-fA-F]{6}',str(data.get(k,''))): raise ValueError('颜色格式不正确')
+                    with connect() as c:
+                        # Deleted categories become uncategorized; articles remain intact.
+                        for r in c.execute('SELECT id,category FROM posts').fetchall():
+                            if r['category'] and r['category'] not in cats: c.execute("UPDATE posts SET category='' WHERE id=?",(r['id'],))
+                        for k in ('title','subtitle','accent','background','categories','menus'):
+                            value=data.get(k,'')
+                            if k in ('title','subtitle'): value=str(value)[:300]
+                            save_setting(c,k,value)
+                elif path=='/api/password':
+                    current=setting('password'); old=str(data.get('old','')); new=str(data.get('password',''))
+                    if not hmac.compare_digest(password_hash(old,current['salt']),current['hash']): raise ValueError('原密码错误')
+                    if not 8<=len(new)<=256: raise ValueError('新密码需为 8 至 256 位')
+                    salt=secrets.token_hex(16)
+                    with connect() as c: save_setting(c,'password',{'salt':salt,'hash':password_hash(new,salt)})
+                    SESSIONS.clear()
+                else: return self.respond(404,{'error':'接口不存在'})
+            self.respond(200,{'ok':True})
+        except (ValueError,TypeError,KeyError) as e: self.respond(400,{'error':str(e)})
+        except (BrokenPipeError,ConnectionResetError): pass
+        except Exception: self.respond(500,{'error':'保存失败。请检查磁盘空间及文件夹写入权限。'})
+        finally:
+            # Rejecting large uploads must not leave unread bytes on a reused connection.
+            self.close_connection=True
+
+def main():
+    init()
+    port=int(os.environ.get('BLOG_PORT','8765'))
+    try: server=Server(('127.0.0.1',port),Handler)
+    except OSError:
+        print('Port is busy. Close the previous Blog window, or set BLOG_PORT to another port.')
+        return 1
+    print(f'Portable Blog: http://127.0.0.1:{port}\nData: {DATA}\nPress Ctrl+C to stop. Close this window before copying the folder.',flush=True)
+    if '--no-browser' not in sys.argv: threading.Timer(0.8,lambda:webbrowser.open(f'http://127.0.0.1:{port}')).start()
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+    return 0
+if __name__=='__main__': sys.exit(main())
