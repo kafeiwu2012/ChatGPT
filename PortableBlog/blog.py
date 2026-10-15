@@ -2,6 +2,8 @@
 """Portable Blog: standard-library-only local publishing."""
 import base64, hashlib, hmac, io, json, mimetypes, os, re, secrets, shutil, sqlite3, sys, threading, time, urllib.parse, webbrowser, zipfile
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from richtext import sanitize, typography
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -21,6 +23,10 @@ def init():
 CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,category TEXT NOT NULL,status TEXT NOT NULL,created TEXT NOT NULL,updated TEXT NOT NULL,attachments TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pages(slug TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,attachments TEXT NOT NULL,status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,name TEXT NOT NULL,file TEXT NOT NULL,type TEXT NOT NULL,size INTEGER NOT NULL,created TEXT NOT NULL);''')
+        for table in ('posts','pages'):
+            columns={r[1] for r in c.execute('PRAGMA table_info('+table+')')}
+            if 'format' not in columns: c.execute("ALTER TABLE "+table+" ADD COLUMN format TEXT NOT NULL DEFAULT 'plain'")
+            if 'typography' not in columns: c.execute("ALTER TABLE "+table+" ADD COLUMN typography TEXT NOT NULL DEFAULT '{}'")
         defaults={'title':'我的私人博客','subtitle':'欢迎来到我的小小宇宙。','accent':'#111111','background':'#ffffff','categories':['生活记录','学习笔记','旅行'],'menus':[{'label':'Home','target':'home'},{'label':'About','target':'page:about'},{'label':'Blog','target':'blog'},{'label':'Contact','target':'page:contact'},{'label':'旅行','target':'category:旅行'}], 'blog_heading':'欢迎来玩。','footer_text':'记录生活，收藏时光。','page_size':9}
         for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',(k,json.dumps(v,ensure_ascii=False)))
         if not c.execute("SELECT 1 FROM settings WHERE key='_pages_initialized'").fetchone():
@@ -32,7 +38,7 @@ CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,name TEXT NOT NULL,file TEX
             if current.get('accent')=='#335c49': save_setting(c,'accent','#111111')
             if current.get('background')=='#f6f3ed': save_setting(c,'background','#ffffff')
             for slug,title,body in [('home','Home','Hi, welcome to my universe.\n\n[[cover]]\n\n欢迎来到我的小小宇宙。\n这里收藏我的生活、旅途与日常片刻。'),('about','About','关于我\n\n这里是我的私人博客。\n用文字和影像，留下值得记住的日子。'),('contact','Contact','保持联系\n\n你可以在后台的“独立页面”中填写联系方式。')]:
-                c.execute('INSERT OR IGNORE INTO pages VALUES (?,?,?,?,?)',(slug,title,body,'[]','published'))
+                c.execute('INSERT OR IGNORE INTO pages (slug,title,body,attachments,status) VALUES (?,?,?,?,?)',(slug,title,body,'[]','published'))
             save_setting(c,'_pages_initialized',True)
 
 def setting(k,default=None):
@@ -75,7 +81,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.valid_host(): return self.respond(403,{'error':'不允许的访问地址'})
         url=urllib.parse.urlsplit(self.path); path=url.path
         if path=='/': return self.respond(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
-        if path=='/assets/cover.svg': return self.respond(200,(ROOT/'assets'/'cover.svg').read_bytes(),'image/svg+xml')
+        if path.startswith('/assets/'):
+            target=(ROOT/urllib.parse.unquote(path.lstrip('/'))).resolve()
+            if not target.is_relative_to((ROOT/'assets').resolve()) or not target.is_file(): return self.respond(404,{'error':'文件不存在'})
+            return self.respond(200,target.read_bytes(),mimetypes.guess_type(target.name)[0] or 'application/octet-stream')
         if path=='/api/state':
             with connect() as c:
                 settings={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM settings') if r['key']!='password' and not r['key'].startswith('_')}
@@ -85,7 +94,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.auth():
                     visible={a for p in posts+pages for a in json.loads(p['attachments'])}
                     media=[m for m in media if m['id'] in visible]
-            for p in posts+pages: p['attachments']=json.loads(p['attachments'])
+            for p in posts+pages:
+                p['attachments']=json.loads(p['attachments'])
+                p['typography']=json.loads(p['typography'])
             return self.respond(200,{'settings':settings,'posts':posts,'pages':pages,'media':media,'admin':self.auth(),'needs_setup':setting('password') is None})
         if path.startswith('/media/'):
             ident=path.split('/')[-1]
@@ -191,13 +202,17 @@ class Handler(BaseHTTPRequestHandler):
                     title=str(data.get('title','')).strip()[:200]
                     if not title: raise ValueError('请填写页面标题')
                     body=str(data.get('body',''))
+                    fmt=data.get('format','plain')
+                    if fmt not in ('plain','html'): raise ValueError('文本格式不正确')
+                    style=typography(data.get('typography'))
                     attachments=list(dict.fromkeys(re.findall(r'\[\[media:([a-f0-9]{32})\]\]',body)))
+                    if fmt=='html': body,attachments=sanitize(body)
                     status=data.get('status','draft')
                     if status not in ('draft','published'): raise ValueError('页面状态不正确')
                     with connect() as c:
                         valid={r[0] for r in c.execute('SELECT id FROM media')}
                         if any(x not in valid for x in attachments): raise ValueError('页面引用的媒体不存在')
-                        c.execute('INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?)',(slug,title,body,json.dumps(attachments),status))
+                        c.execute('INSERT OR REPLACE INTO pages (slug,title,body,attachments,status,format,typography) VALUES (?,?,?,?,?,?,?)',(slug,title,body,json.dumps(attachments),status,fmt,style))
                     return self.respond(200,{'ok':True})
                 if path=='/api/delete-page':
                     slug=data.get('slug')
@@ -211,17 +226,24 @@ class Handler(BaseHTTPRequestHandler):
                     title=str(data.get('title','')).strip()[:200]
                     if not title: raise ValueError('请填写文章标题')
                     ident=data.get('id') or secrets.token_hex(16)
+                    body=str(data.get('body',''))
+                    fmt=data.get('format','plain')
+                    if fmt not in ('plain','html'): raise ValueError('文本格式不正确')
+                    style=typography(data.get('typography'))
+                    inline=[]
+                    if fmt=='html':body,inline=sanitize(body)
                     status=data.get('status','draft')
                     if status not in ('draft','published'): raise ValueError('文章状态不正确')
                     category=str(data.get('category',''))
                     if category and category not in setting('categories'): raise ValueError('请选择已有类目')
                     attachments=data.get('attachments',[])
                     if not isinstance(attachments,list): raise ValueError('附件格式错误')
+                    attachments=list(dict.fromkeys(attachments+inline))
                     with connect() as c:
                         valid={r[0] for r in c.execute('SELECT id FROM media')}
                         if any(x not in valid for x in attachments): raise ValueError('附件不存在')
                         existing=c.execute('SELECT created FROM posts WHERE id=?',(ident,)).fetchone()
-                        c.execute('INSERT OR REPLACE INTO posts VALUES (?,?,?,?,?,?,?,?)',(ident,title,str(data.get('body','')),category,status,existing[0] if existing else now(),now(),json.dumps(list(dict.fromkeys(attachments)))))
+                        c.execute('INSERT OR REPLACE INTO posts (id,title,body,category,status,created,updated,attachments,format,typography) VALUES (?,?,?,?,?,?,?,?,?,?)',(ident,title,body,category,status,existing[0] if existing else now(),now(),json.dumps(list(dict.fromkeys(attachments))),fmt,style))
                     return self.respond(200,{'id':ident})
                 if path=='/api/delete-post':
                     with connect() as c: c.execute('DELETE FROM posts WHERE id=?',(data.get('id'),))
