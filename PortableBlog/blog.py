@@ -19,9 +19,22 @@ def init():
     with connect() as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,category TEXT NOT NULL,status TEXT NOT NULL,created TEXT NOT NULL,updated TEXT NOT NULL,attachments TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pages(slug TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,attachments TEXT NOT NULL,status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,name TEXT NOT NULL,file TEXT NOT NULL,type TEXT NOT NULL,size INTEGER NOT NULL,created TEXT NOT NULL);''')
-        defaults={'title':'我的离线博客','subtitle':'记录生活，收藏时光。','accent':'#335c49','background':'#f6f3ed','categories':['生活记录','学习笔记'],'menus':[{'label':'首页','target':'home'},{'label':'文章归档','target':'archive'},{'label':'媒体收藏','target':'media'}]}
+        defaults={'title':'我的私人博客','subtitle':'欢迎来到我的小小宇宙。','accent':'#111111','background':'#ffffff','categories':['生活记录','学习笔记','旅行'],'menus':[{'label':'Home','target':'home'},{'label':'About','target':'page:about'},{'label':'Blog','target':'blog'},{'label':'Contact','target':'page:contact'},{'label':'旅行','target':'category:旅行'}], 'blog_heading':'欢迎来玩。','footer_text':'记录生活，收藏时光。','page_size':9}
         for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',(k,json.dumps(v,ensure_ascii=False)))
+        if not c.execute("SELECT 1 FROM settings WHERE key='_pages_initialized'").fetchone():
+            # Upgrade only untouched v1 defaults; custom menus and colors remain intact.
+            current={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM settings')}
+            old_menu=[{'label':'首页','target':'home'},{'label':'文章归档','target':'archive'},{'label':'媒体收藏','target':'media'}]
+            if current.get('menus')==old_menu:
+                save_setting(c,'menus',[{'label':'Home','target':'home'},{'label':'About','target':'page:about'},{'label':'Blog','target':'blog'},{'label':'Contact','target':'page:contact'}]+old_menu[1:])
+            if current.get('accent')=='#335c49': save_setting(c,'accent','#111111')
+            if current.get('background')=='#f6f3ed': save_setting(c,'background','#ffffff')
+            for slug,title,body in [('home','Home','Hi, welcome to my universe.\n\n[[cover]]\n\n欢迎来到我的小小宇宙。\n这里收藏我的生活、旅途与日常片刻。'),('about','About','关于我\n\n这里是我的私人博客。\n用文字和影像，留下值得记住的日子。'),('contact','Contact','保持联系\n\n你可以在后台的“独立页面”中填写联系方式。')]:
+                c.execute('INSERT OR IGNORE INTO pages VALUES (?,?,?,?,?)',(slug,title,body,'[]','published'))
+            save_setting(c,'_pages_initialized',True)
+
 def setting(k,default=None):
     with connect() as c:
         row=c.execute('SELECT value FROM settings WHERE key=?',(k,)).fetchone()
@@ -62,22 +75,25 @@ class Handler(BaseHTTPRequestHandler):
         if not self.valid_host(): return self.respond(403,{'error':'不允许的访问地址'})
         url=urllib.parse.urlsplit(self.path); path=url.path
         if path=='/': return self.respond(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
+        if path=='/assets/cover.svg': return self.respond(200,(ROOT/'assets'/'cover.svg').read_bytes(),'image/svg+xml')
         if path=='/api/state':
             with connect() as c:
-                settings={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM settings') if r['key']!='password'}
+                settings={r['key']:json.loads(r['value']) for r in c.execute('SELECT * FROM settings') if r['key']!='password' and not r['key'].startswith('_')}
                 posts=[dict(r) for r in c.execute('SELECT * FROM posts ORDER BY created DESC') if self.auth() or r['status']=='published']
+                pages=[dict(r) for r in c.execute('SELECT * FROM pages ORDER BY slug') if self.auth() or r['status']=='published']
                 media=[dict(r) for r in c.execute('SELECT * FROM media ORDER BY created DESC')]
                 if not self.auth():
-                    visible={a for p in posts for a in json.loads(p['attachments'])}
+                    visible={a for p in posts+pages for a in json.loads(p['attachments'])}
                     media=[m for m in media if m['id'] in visible]
-            for p in posts: p['attachments']=json.loads(p['attachments'])
-            return self.respond(200,{'settings':settings,'posts':posts,'media':media,'admin':self.auth(),'needs_setup':setting('password') is None})
+            for p in posts+pages: p['attachments']=json.loads(p['attachments'])
+            return self.respond(200,{'settings':settings,'posts':posts,'pages':pages,'media':media,'admin':self.auth(),'needs_setup':setting('password') is None})
         if path.startswith('/media/'):
             ident=path.split('/')[-1]
             with connect() as c:
                 row=c.execute('SELECT * FROM media WHERE id=?',(ident,)).fetchone()
                 if row and not self.auth():
                     public=any(ident in json.loads(p[0]) for p in c.execute("SELECT attachments FROM posts WHERE status='published'"))
+                    public=public or any(ident in json.loads(p[0]) for p in c.execute("SELECT attachments FROM pages WHERE status='published'"))
                     if not public: row=None
             if not row: return self.respond(404,{'error':'文件不存在或尚未发布'})
             file=MEDIA/row['file']
@@ -169,6 +185,28 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/logout':
                     for token in re.findall(r'blog_session=([a-f0-9]+)',self.headers.get('Cookie','')): SESSIONS.pop(token,None)
                     return self.respond(200,{'ok':True},headers={'Set-Cookie':'blog_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+                if path=='/api/page':
+                    slug=str(data.get('slug',''))
+                    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,59}',slug): raise ValueError('页面标识只能使用小写字母、数字和短横线，最多 60 位')
+                    title=str(data.get('title','')).strip()[:200]
+                    if not title: raise ValueError('请填写页面标题')
+                    body=str(data.get('body',''))
+                    attachments=list(dict.fromkeys(re.findall(r'\[\[media:([a-f0-9]{32})\]\]',body)))
+                    status=data.get('status','draft')
+                    if status not in ('draft','published'): raise ValueError('页面状态不正确')
+                    with connect() as c:
+                        valid={r[0] for r in c.execute('SELECT id FROM media')}
+                        if any(x not in valid for x in attachments): raise ValueError('页面引用的媒体不存在')
+                        c.execute('INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?)',(slug,title,body,json.dumps(attachments),status))
+                    return self.respond(200,{'ok':True})
+                if path=='/api/delete-page':
+                    slug=data.get('slug')
+                    if slug=='home': raise ValueError('首页不能删除，可编辑首页内容')
+                    with connect() as c:
+                        menus=setting('menus',[])
+                        if any(m['target']=='page:'+str(slug) for m in menus): raise ValueError('请先在菜单设置中移除此页面的导航项')
+                        c.execute('DELETE FROM pages WHERE slug=?',(slug,))
+                    return self.respond(200,{'ok':True})
                 if path=='/api/post':
                     title=str(data.get('title','')).strip()[:200]
                     if not title: raise ValueError('请填写文章标题')
@@ -190,7 +228,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path=='/api/delete-media':
                     ident=data.get('id')
                     with connect() as c:
-                        if any(ident in json.loads(r[0]) for r in c.execute('SELECT attachments FROM posts')): raise ValueError('文件正在被文章使用，请先从文章附件中移除')
+                        if any(ident in json.loads(r[0]) for r in c.execute('SELECT attachments FROM posts UNION ALL SELECT attachments FROM pages')): raise ValueError('文件正在被文章或页面使用，请先移除引用')
                         row=c.execute('SELECT file FROM media WHERE id=?',(ident,)).fetchone()
                         if row: (MEDIA/row[0]).unlink(missing_ok=True)
                         c.execute('DELETE FROM media WHERE id=?',(ident,))
@@ -198,18 +236,21 @@ class Handler(BaseHTTPRequestHandler):
                     cats=data.get('categories',[]); menus=data.get('menus',[])
                     if not isinstance(cats,list) or len(cats)>100 or any(not isinstance(x,str) or not x.strip() or len(x)>80 for x in cats): raise ValueError('类目格式不正确，最多 100 个')
                     if not isinstance(menus,list) or len(menus)>20: raise ValueError('菜单最多 20 项')
-                    targets={'home','archive','media'}|{'category:'+x for x in cats}
+                    with connect() as c: page_targets={'page:'+r[0] for r in c.execute('SELECT slug FROM pages')}
+                    targets={'home','blog','archive','media'}|{'category:'+x for x in cats}|page_targets
                     for m in menus:
-                        if not isinstance(m,dict) or m.get('target') not in targets or not str(m.get('label','')).strip(): raise ValueError('菜单目标需为首页、归档、媒体或现有类目')
+                        if not isinstance(m,dict) or m.get('target') not in targets or not str(m.get('label','')).strip(): raise ValueError('菜单目标需为首页、博客、归档、媒体、现有页面或类目')
+                    if 'page_size' in data and (type(data['page_size']) is not int or not 1<=data['page_size']<=60): raise ValueError('每页文章数需为 1 至 60')
                     for k in ('accent','background'):
                         if not re.fullmatch(r'#[0-9a-fA-F]{6}',str(data.get(k,''))): raise ValueError('颜色格式不正确')
                     with connect() as c:
                         # Deleted categories become uncategorized; articles remain intact.
                         for r in c.execute('SELECT id,category FROM posts').fetchall():
                             if r['category'] and r['category'] not in cats: c.execute("UPDATE posts SET category='' WHERE id=?",(r['id'],))
-                        for k in ('title','subtitle','accent','background','categories','menus'):
+                        for k in ('title','subtitle','accent','background','categories','menus','blog_heading','footer_text','page_size'):
+                            if k not in data: continue
                             value=data.get(k,'')
-                            if k in ('title','subtitle'): value=str(value)[:300]
+                            if k in ('title','subtitle','blog_heading','footer_text'): value=str(value)[:300]
                             save_setting(c,k,value)
                 elif path=='/api/password':
                     current=setting('password'); old=str(data.get('old','')); new=str(data.get('password',''))
